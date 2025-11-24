@@ -1,0 +1,11 @@
+{
+    "order": [
+        "layout",
+        "battery_status",
+        "trip",
+        "battery_select",
+        "modes",
+        "signals"
+    ],
+    "start": "layout"
+}
