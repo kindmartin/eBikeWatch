@@ -46,13 +46,33 @@ DEFAULTS = {
     "throttle_factor": 1.0,
     "throttle_mode": "power",
     "throttle_power_max_w": 500.0,
-    "throttle_speed_max_kmh": 50.0,
+    "throttle_speed_max_kmh": 60.0,
     "throttle_mix_speed_kmh": 20.0,
     "throttle_mix_hyst_kmh": 3.0,
     "throttle_control_gain": 0.25,
     "throttle_filter_alpha": 0.3,
     "throttle_ratio_alpha": 0.4,
+    "power_pid_kp": 0.25,
+    "power_pid_ki": 0.02,
+    "power_pid_kd": 0.0,
+    "power_pid_integral_limit": 0.5,
+    "power_pid_d_alpha": 0.3,
+    "power_pid_output_alpha": 0.4,
+    "speed_pid_kp": 0.35,
+    "speed_pid_ki": 0.03,
+    "speed_pid_kd": 0.0,
+    "speed_pid_integral_limit": 0.5,
+    "speed_pid_d_alpha": 0.3,
+    "speed_pid_output_alpha": 0.4,
+    "torque_pid_kp": 0.3,
+    "torque_pid_ki": 0.02,
+    "torque_pid_kd": 0.0,
+    "torque_pid_integral_limit": 0.5,
+    "torque_pid_d_alpha": 0.3,
+    "torque_pid_output_alpha": 0.4,
     "throttle_torque_ref_speed_kmh": 10.0,
+    "monitor_control_enabled": False,
+    "monitor_control_period_ms": 1000,
     "brake_supply_voltage": 3.3,
     "brake_input_min": 0.85,
     "brake_input_threshold": 1.6,
@@ -207,6 +227,13 @@ class MotorControl:
         self._filtered_speed = None
         self._filtered_torque = None
         self._mix_use_speed = False
+        self._pid_state = {
+            "power": {"integral": 0.0, "derivative": 0.0, "last_error": 0.0, "last_output": None},
+            "speed": {"integral": 0.0, "derivative": 0.0, "last_error": 0.0, "last_output": None},
+            "torque": {"integral": 0.0, "derivative": 0.0, "last_error": 0.0, "last_output": None},
+        }
+        self._last_loop_ms = None
+        self._monitor_task = None
 
     def _ensure_i2c(self):
         if self._i2c is not None:
@@ -400,6 +427,73 @@ class MotorControl:
             pass
         return None
 
+    def _reset_pid(self, mode=None):
+        targets = [mode] if mode else self._pid_state.keys()
+        for key in targets:
+            state = self._pid_state.get(key)
+            if not state:
+                continue
+            state["integral"] = 0.0
+            state["derivative"] = 0.0
+            state["last_error"] = 0.0
+            state["last_output"] = None
+
+    def _get_pid_cfg(self, mode):
+        prefix = f"{mode}_pid"
+        kp = float(self.cfg.get(f"{prefix}_kp", self.cfg.get("throttle_control_gain", 0.25) or 0.0) or 0.0)
+        ki = float(self.cfg.get(f"{prefix}_ki", 0.0) or 0.0)
+        kd = float(self.cfg.get(f"{prefix}_kd", 0.0) or 0.0)
+        i_limit = float(self.cfg.get(f"{prefix}_integral_limit", 0.5) or 0.0)
+        d_alpha = _clamp(float(self.cfg.get(f"{prefix}_d_alpha", 0.3) or 0.0), 0.0, 1.0)
+        output_alpha = _clamp(
+            float(self.cfg.get(f"{prefix}_output_alpha", self.cfg.get("throttle_ratio_alpha", 0.4) or 0.0) or 0.0),
+            0.0,
+            1.0,
+        )
+        return {
+            "kp": kp,
+            "ki": ki,
+            "kd": kd,
+            "i_limit": abs(i_limit),
+            "d_alpha": d_alpha,
+            "output_alpha": output_alpha,
+        }
+
+    def _control_pid_with_metric(self, mode, desired_ratio, metric_value, metric_max, dt_ms):
+        cfg = self._get_pid_cfg(mode)
+        enabled = cfg["kp"] > 0.0 or cfg["ki"] > 0.0 or cfg["kd"] > 0.0
+        throttle_factor = _clamp(float(self.cfg.get("throttle_factor", 1.0) or 1.0), 0.0, 1.0)
+        base_ratio = _clamp(desired_ratio, 0.0, 1.0)
+        if not enabled or metric_value is None or metric_max is None or metric_max <= 0.0 or dt_ms is None:
+            self._reset_pid(mode)
+            self._control_ratio = base_ratio
+            return base_ratio
+        target_ratio = _clamp(base_ratio * throttle_factor, 0.0, 1.0)
+        actual_ratio = _clamp(float(metric_value) / float(metric_max), 0.0, 2.0)
+        dt_ms = max(1, int(dt_ms))
+        dt_s = dt_ms / 1000.0
+        state = self._pid_state.get(mode)
+        if state is None:
+            state = {"integral": 0.0, "derivative": 0.0, "last_error": 0.0, "last_output": None}
+            self._pid_state[mode] = state
+        error = target_ratio - actual_ratio
+        integral = state["integral"] + error * dt_s
+        integral = _clamp(integral, -cfg["i_limit"], cfg["i_limit"])
+        state["integral"] = integral
+        deriv_raw = (error - state["last_error"]) / dt_s
+        derivative = state["derivative"] + cfg["d_alpha"] * (deriv_raw - state["derivative"])
+        state["derivative"] = derivative
+        state["last_error"] = error
+        output = base_ratio + cfg["kp"] * error + cfg["ki"] * integral + cfg["kd"] * derivative
+        prev = state["last_output"]
+        smoothed = _low_pass(prev, output, cfg["output_alpha"])
+        if smoothed is None:
+            smoothed = output
+        smoothed = _clamp(smoothed, 0.0, 1.0)
+        state["last_output"] = smoothed
+        self._control_ratio = smoothed
+        return smoothed
+
     def _control_with_metric(self, desired_ratio, metric_value, metric_max, *, filter_attr, gain, filter_alpha, ratio_alpha):
         metric_max = float(metric_max or 0.0)
         if metric_value is None or metric_max <= 0.0:
@@ -423,17 +517,19 @@ class MotorControl:
         self._control_ratio = smoothed
         return smoothed
 
-    def _apply_control_mode(self, ratio_input, *, brake_active):
+    def _apply_control_mode(self, ratio_input, *, brake_active, dt_ms=None):
         if brake_active:
             self._control_ratio = 0.0
             self._filtered_power = None
             self._filtered_speed = None
             self._filtered_torque = None
+            self._reset_pid()
             return 0.0
 
         mode = str(self.cfg.get("throttle_mode", "power") or "").lower()
         if not mode or mode in {"basic", "none", "off"} or self._state is None:
             self._control_ratio = ratio_input
+            self._reset_pid()
             return ratio_input
 
         if mode != "mix":
@@ -441,19 +537,12 @@ class MotorControl:
 
         if mode in {"open", "open_loop", "direct", "raw"}:
             self._control_ratio = ratio_input
+            self._reset_pid()
             self._filtered_power = None
             self._filtered_speed = None
             self._filtered_torque = None
             self._mix_use_speed = False
             return ratio_input
-
-        gain = max(0.0, float(self.cfg.get("throttle_control_gain", 0.25) or 0.0))
-        if gain <= 0.0:
-            self._control_ratio = ratio_input
-            return ratio_input
-
-        filter_alpha = _clamp(float(self.cfg.get("throttle_filter_alpha", 0.3) or 0.0), 0.0, 1.0)
-        ratio_alpha = _clamp(float(self.cfg.get("throttle_ratio_alpha", 0.4) or 0.0), 0.0, 1.0)
 
         power_w = self._extract_power_w()
         speed_kmh = self._extract_speed_kmh()
@@ -461,26 +550,10 @@ class MotorControl:
         max_speed = max(1.0, float(self.cfg.get("throttle_speed_max_kmh", 50.0) or 1.0))
 
         if mode == "power":
-            return self._control_with_metric(
-                ratio_input,
-                power_w,
-                max_power,
-                filter_attr="_filtered_power",
-                gain=gain,
-                filter_alpha=filter_alpha,
-                ratio_alpha=ratio_alpha,
-            )
+            return self._control_pid_with_metric("power", ratio_input, power_w, max_power, dt_ms)
 
         if mode == "speed":
-            return self._control_with_metric(
-                ratio_input,
-                speed_kmh,
-                max_speed,
-                filter_attr="_filtered_speed",
-                gain=gain,
-                filter_alpha=filter_alpha,
-                ratio_alpha=ratio_alpha,
-            )
+            return self._control_pid_with_metric("speed", ratio_input, speed_kmh, max_speed, dt_ms)
 
         if mode == "torque":
             torque = None
@@ -491,15 +564,7 @@ class MotorControl:
             ref_speed_mps = max(ref_speed / 3.6, 0.3)
             max_speed_mps = max(max_speed / 3.6, ref_speed_mps)
             torque_max = max_power / max_speed_mps
-            return self._control_with_metric(
-                ratio_input,
-                torque,
-                torque_max,
-                filter_attr="_filtered_torque",
-                gain=gain,
-                filter_alpha=filter_alpha,
-                ratio_alpha=ratio_alpha,
-            )
+            return self._control_pid_with_metric("torque", ratio_input, torque, torque_max, dt_ms)
 
         if mode == "mix":
             threshold = float(self.cfg.get("throttle_mix_speed_kmh", 20.0) or 0.0)
@@ -511,15 +576,7 @@ class MotorControl:
                 if speed_kmh is not None and speed_kmh >= threshold:
                     self._mix_use_speed = True
             if self._mix_use_speed:
-                return self._control_with_metric(
-                    ratio_input,
-                    speed_kmh,
-                    max_speed,
-                    filter_attr="_filtered_speed",
-                    gain=gain,
-                    filter_alpha=filter_alpha,
-                    ratio_alpha=ratio_alpha,
-                )
+                return self._control_pid_with_metric("speed", ratio_input, speed_kmh, max_speed, dt_ms)
             torque = None
             if power_w is not None:
                 speed_mps = max((speed_kmh or 0.0) / 3.6, 0.3)
@@ -528,15 +585,7 @@ class MotorControl:
             ref_speed_mps = max(ref_speed / 3.6, 0.3)
             max_speed_mps = max(max_speed / 3.6, ref_speed_mps)
             torque_max = max_power / max_speed_mps
-            return self._control_with_metric(
-                ratio_input,
-                torque,
-                torque_max,
-                filter_attr="_filtered_torque",
-                gain=gain,
-                filter_alpha=filter_alpha,
-                ratio_alpha=ratio_alpha,
-            )
+            return self._control_pid_with_metric("torque", ratio_input, torque, torque_max, dt_ms)
 
         self._control_ratio = ratio_input
         return ratio_input
@@ -554,6 +603,7 @@ class MotorControl:
         self._filtered_speed = None
         self._filtered_torque = None
         self._mix_use_speed = False
+        self._reset_pid()
         return True
 
     def bind_state(self, state):
@@ -593,8 +643,10 @@ class MotorControl:
             period_ms = int(self.cfg.get("update_period_ms", 20) or 20)
         period_ms = max(1, period_ms)
         self._ensure_hw()
+        self._refresh_monitor_task()
         while True:
             loop_started = _ticks_ms_int()
+            self._refresh_monitor_task()
             try:
                 self._ensure_hw()
                 vt_raw = self._adc_read_volts(self._adc_t)
@@ -613,7 +665,14 @@ class MotorControl:
                 except Exception:
                     brake_threshold = 1.6
                 brake_active = vb >= brake_threshold
-                control_ratio = self._apply_control_mode(raw_ratio, brake_active=brake_active)
+                if self._last_loop_ms is None:
+                    dt_ms = period_ms
+                else:
+                    dt_ms = _ticks_diff_int(loop_started, self._last_loop_ms)
+                    if dt_ms <= 0:
+                        dt_ms = period_ms
+                self._last_loop_ms = loop_started
+                control_ratio = self._apply_control_mode(raw_ratio, brake_active=brake_active, dt_ms=dt_ms)
                 if control_ratio is None:
                     control_ratio = raw_ratio
                 control_ratio = _clamp(control_ratio, 0.0, 1.0)
@@ -714,6 +773,260 @@ class MotorControl:
                 await asyncio.sleep_ms(wait_ms)
             else:
                 await asyncio.sleep_ms(0)
+
+    def _monitor_adc_percent(self, voltage):
+        if voltage is None:
+            return None
+        try:
+            base = float(self.cfg.get("throttle_monitor_min", self.cfg.get("throttle_input_min", 0.85) or 0.85))
+        except Exception:
+            base = 0.85
+        try:
+            max_override = self.cfg.get("throttle_monitor_max")
+            if max_override is not None:
+                top = float(max_override)
+            else:
+                span = float(self.cfg.get("throttle_monitor_span", 2.0) or 2.0)
+                top = base + span
+        except Exception:
+            top = base + 2.0
+        span = max(0.1, top - base)
+        percent = _clamp((float(voltage) - base) / span, 0.0, 1.0) * 100.0
+        return percent
+
+    def _monitor_metric_context(self, raw_ratio):
+        mode = str(self.cfg.get("throttle_mode", "power") or "").lower()
+        throttle_factor = _clamp(float(self.cfg.get("throttle_factor", 1.0) or 1.0), 0.0, 1.0)
+        target_ratio = _clamp(raw_ratio * throttle_factor, 0.0, 1.0)
+        power_w = self._extract_power_w()
+        speed_kmh = self._extract_speed_kmh()
+        torque = None
+        if power_w is not None:
+            speed_mps = max((speed_kmh or 0.0) / 3.6, 0.3)
+            torque = float(power_w) / speed_mps
+        max_power = max(1.0, float(self.cfg.get("throttle_power_max_w", 500.0) or 1.0))
+        max_speed = max(1.0, float(self.cfg.get("throttle_speed_max_kmh", 60.0) or 1.0))
+        ref_speed = max(0.1, float(self.cfg.get("throttle_torque_ref_speed_kmh", 10.0) or 0.1))
+        ref_speed_mps = max(ref_speed / 3.6, 0.3)
+        max_speed_mps = max(max_speed / 3.6, ref_speed_mps)
+        torque_max = max_power / max_speed_mps
+
+        def _build(name, value, max_value, units):
+            if max_value is None:
+                target_value = None
+            else:
+                target_value = target_ratio * max_value
+            return {
+                "name": name,
+                "value": value,
+                "target": target_value,
+                "max": max_value,
+                "units": units,
+            }
+
+        if mode in {"open", "open_loop", "direct", "raw", "none", "off", "basic"}:
+            return None
+        if mode == "speed":
+            return _build("speed", speed_kmh, max_speed, "km/h")
+        if mode == "torque":
+            return _build("torque", torque, torque_max, "Nm")
+        if mode == "mix":
+            if self._mix_use_speed:
+                return _build("speed", speed_kmh, max_speed, "km/h")
+            return _build("torque", torque, torque_max, "Nm")
+        # Default to power
+        return _build("power", power_w, max_power, "W")
+
+    def _monitor_snapshot(self):
+        try:
+            raw_ratio_val = float(self.last_ratio_raw)
+        except Exception:
+            raw_ratio_val = 0.0
+        try:
+            control_ratio_val = float(self.last_ratio_control)
+        except Exception:
+            control_ratio_val = raw_ratio_val
+        raw_ratio = _clamp(raw_ratio_val, 0.0, 1.0)
+        control_ratio = _clamp(control_ratio_val, 0.0, 1.0)
+        adc_pct = self._monitor_adc_percent(self.last_vt)
+        metric_context = self._monitor_metric_context(raw_ratio)
+        speed_kmh = self._extract_speed_kmh()
+        try:
+            mode_label = str(self.cfg.get("throttle_mode", "") or "").lower()
+        except Exception:
+            mode_label = ""
+        return {
+            "mode": mode_label or "unknown",
+            "adc_percent": adc_pct,
+            "adc_voltage": self.last_vt,
+            "raw_ratio": raw_ratio,
+            "control_ratio": control_ratio,
+            "dac_voltage": self.last_dac_throttle_v,
+            "speed_kmh": speed_kmh,
+            "metric": metric_context,
+        }
+
+    def _monitor_indicator(self, target_pct, actual_pct):
+        if target_pct is None or actual_pct is None:
+            return "?"
+        delta = target_pct - actual_pct
+        if delta >= 10.0:
+            return ">>"
+        if delta >= 5.0:
+            return ">"
+        if delta <= -10.0:
+            return "<<"
+        if delta <= -5.0:
+            return "<"
+        return "="
+
+    def _format_monitor_line(self, snapshot):
+        if not snapshot:
+            return None
+        mode = snapshot.get("mode", "unknown")
+        adc_pct = snapshot.get("adc_percent")
+        adc_line = "ADC=na"
+        adc_voltage = snapshot.get("adc_voltage")
+        if adc_pct is not None:
+            if adc_voltage is not None:
+                adc_line = "ADC={:4.1f}% ({:.2f}V)".format(adc_pct, adc_voltage)
+            else:
+                adc_line = "ADC={:4.1f}%".format(adc_pct)
+        raw_ratio = snapshot.get("raw_ratio", 0.0)
+        control_ratio = snapshot.get("control_ratio", raw_ratio)
+        dac_voltage = snapshot.get("dac_voltage")
+        dac_line = "DAC=na" if dac_voltage is None else "DAC={:.2f}V".format(dac_voltage)
+        metric = snapshot.get("metric")
+        if metric is not None:
+            name = metric.get("name", "metric")
+            value = metric.get("value")
+            target = metric.get("target")
+            max_value = metric.get("max")
+            units = metric.get("units", "")
+            metric_pct = None
+            target_pct = None
+            if value is not None and max_value:
+                metric_pct = _clamp(float(value) / float(max_value), 0.0, 2.0) * 100.0
+            if target is not None and max_value:
+                target_pct = _clamp(float(target) / float(max_value), 0.0, 2.0) * 100.0
+            if metric_pct is None and control_ratio is not None:
+                metric_pct = control_ratio * 100.0
+            if target_pct is None and raw_ratio is not None:
+                target_pct = raw_ratio * 100.0
+            indicator = self._monitor_indicator(target_pct, metric_pct)
+            unit_label = units or ""
+            if value is not None and metric_pct is not None:
+                metric_desc = "{}={:.1f}{} ({:.1f}%)".format(name, value, unit_label, metric_pct)
+            elif value is not None:
+                metric_desc = "{}={:.1f}{}".format(name, value, unit_label)
+            elif metric_pct is not None:
+                metric_desc = "{}={:.1f}%".format(name, metric_pct)
+            else:
+                metric_desc = "{}=na".format(name)
+            if target is not None and target_pct is not None:
+                target_desc = "target={:.1f}{} ({:.1f}%)".format(target, unit_label, target_pct)
+            elif target is not None:
+                target_desc = "target={:.1f}{}".format(target, unit_label)
+            elif target_pct is not None:
+                target_desc = "target={:.1f}%".format(target_pct)
+            else:
+                target_desc = "target=na"
+            return "mode={} | {} | {} | {} | {} | {}".format(
+                mode,
+                adc_line,
+                metric_desc,
+                target_desc,
+                dac_line,
+                indicator,
+            )
+        # Fallback when no metric available
+        indicator = self._monitor_indicator(raw_ratio * 100.0, control_ratio * 100.0)
+        return "mode={} | {} | raw={:.1f}% | ctrl={:.1f}% | {} | {}".format(
+            mode,
+            adc_line,
+            raw_ratio * 100.0,
+            control_ratio * 100.0,
+            dac_line,
+            indicator,
+        )
+
+    def _refresh_monitor_task(self):
+        enabled = bool(self.cfg.get("monitor_control_enabled"))
+        period_ms_cfg = self.cfg.get("monitor_control_period_ms", 1000)
+        try:
+            period_ms = max(200, int(period_ms_cfg))
+        except Exception:
+            period_ms = 1000
+        if enabled:
+            if self._monitor_task is not None:
+                return
+            task = None
+            create_task = getattr(asyncio, "create_task", None)
+            if callable(create_task):
+                try:
+                    task = create_task(self.monitor_control(period_ms=period_ms))
+                except Exception:
+                    task = None
+            if task is None:
+                get_loop = getattr(asyncio, "get_event_loop", None)
+                if callable(get_loop):
+                    try:
+                        loop = get_loop()
+                        loop_create = getattr(loop, "create_task", None)
+                        if callable(loop_create):
+                            task = loop_create(self.monitor_control(period_ms=period_ms))
+                    except Exception:
+                        task = None
+            if task is None:
+                return
+            self._monitor_task = task
+        else:
+            if self._monitor_task is not None:
+                task = self._monitor_task
+                self._monitor_task = None
+                cancel = getattr(task, "cancel", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except Exception:
+                        pass
+
+    def set_monitor_debug(self, enabled=True, period_ms=None):
+        self.cfg["monitor_control_enabled"] = bool(enabled)
+        if period_ms is not None:
+            try:
+                self.cfg["monitor_control_period_ms"] = max(200, int(period_ms))
+            except Exception:
+                pass
+        return bool(self.cfg["monitor_control_enabled"])
+
+    async def monitor_control(self, period_ms=1000, *, once=False):
+        period_ms = max(200, int(period_ms))
+        try:
+            while True:
+                try:
+                    snapshot = self._monitor_snapshot()
+                    line = self._format_monitor_line(snapshot)
+                    if line:
+                        print("[MotorControl] monitor:", line)
+                    else:
+                        print("[MotorControl] monitor: no data")
+                except Exception as exc:
+                    print("[MotorControl] monitor error:", exc)
+                if once:
+                    break
+                await asyncio.sleep_ms(period_ms)
+        except asyncio.CancelledError:
+            return
+        finally:
+            current_task_fn = getattr(asyncio, "current_task", None)
+            if callable(current_task_fn):
+                try:
+                    current = current_task_fn()
+                    if current is not None and current is self._monitor_task:
+                        self._monitor_task = None
+                except Exception:
+                    pass
 
     def _report_dac_error(self, kind, exc):
         self.dac_status[kind] = False

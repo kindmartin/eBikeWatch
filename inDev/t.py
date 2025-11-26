@@ -20,8 +20,6 @@ from HW import (
     UPDOWN_ADC_PIN,
     ADC_THROTTLE_PIN,
     ADC_BRAKE_PIN,
-    PR_UART_RX,
-    PR_UART_TX,
     TRIP_COUNTER_ID,
     TRIP_COUNTER_PIN,
     TRIP_COUNTER_FILTER_NS,
@@ -54,7 +52,7 @@ from runtime.motor import (
     save_motor_config,
 )
 from runtime.tasks import ui_task, integrator_task, trip_counter_task, heartbeat_task
-from runtime.phaserunner_worker import phaserunner_worker
+import runtime.phaserunner_worker as pr_bridge
 from runtime.hardware import init_dacs_zero
 from UI_helpers.writer import Writer
 
@@ -74,10 +72,34 @@ _TASKS = []
 _STOP_REQUESTED = False
 _RUNNING = False
 _PR_THREAD_ACTIVE = False
-_PR_THREAD_ENABLED = False
+_PR_THREAD_ENABLED = True  # enable PR bridge thread by default
 _PR_THREAD_STACK = 6144
 _PR_THREAD_STOP_REQUESTED = False
 _BG_THREAD_STACK = 12288
+_CONTROL_LOOP_DEBUG_OVERRIDE = None
+_CONTROL_LOOP_DEBUG_PERIOD_MS = None
+
+_PID_PARAM_SUFFIXES = {
+    "kp": "kp",
+    "ki": "ki",
+    "kd": "kd",
+    "integral_limit": "integral_limit",
+    "i_limit": "integral_limit",
+    "limit": "integral_limit",
+    "d_alpha": "d_alpha",
+    "dalpha": "d_alpha",
+    "derivative_alpha": "d_alpha",
+    "output_alpha": "output_alpha",
+    "alpha": "output_alpha",
+}
+_PID_PARAM_GUIDANCE = {
+    "kp": "Raise to reduce steady error; lower if you see oscillation/overshoot.",
+    "ki": "Integrates bias; increase for sagging response, decrease if it slowly ramps past target.",
+    "kd": "Damps fast changes; add when the monitor shows repeated overshoot despite low Kp.",
+    "integral_limit": "Caps the I term; trim down if recovery is sluggish after braking.",
+    "d_alpha": "Smoothing for the derivative; higher=slower filter (less noise, more lag).",
+    "output_alpha": "Low-pass on controller output; reduce for faster reaction, raise to calm DAC jitter.",
+}
 
 _PR_FAST_MS = 100
 _PR_SLOW_MS = 2000
@@ -287,13 +309,11 @@ def _pr_worker_thread():
         return
     _PR_THREAD_ACTIVE = True
     try:
-        phaserunner_worker(
+        pr_bridge.phaserunner_worker(
             _state,
             stop_predicate=_stop_predicate,
             fast_interval_source=_get_pr_fast_interval,
             slow_interval_source=_get_pr_slow_interval,
-            tx_pin=PR_UART_TX,
-            rx_pin=PR_UART_RX,
         )
     finally:
         _PR_THREAD_ACTIVE = False
@@ -526,7 +546,7 @@ def get_pr_intervals():
     return int(_PR_FAST_MS), int(_PR_SLOW_MS)
 
 
-def set_pr_fast_interval(ms=None):
+def set_pr_fast_interval(ms=None, *, wait_ms=1000):
     """Set or query Phaserunner fast polling period (ms)."""
     global _PR_FAST_MS
     if ms is None:
@@ -537,11 +557,15 @@ def set_pr_fast_interval(ms=None):
         raise ValueError("invalid fast interval")
     if value < 20:
         value = 20
-    _PR_FAST_MS = value
-    return int(_PR_FAST_MS)
+    resp = pr_bridge.send_command({"cmd": "set_fast", "ms": value}, wait_ms=wait_ms)
+    if not resp or not resp.get("ok"):
+        raise RuntimeError("set_fast failed: {}".format(resp))
+    applied = int(resp.get("fast_ms", value))
+    _PR_FAST_MS = applied
+    return applied
 
 
-def set_pr_slow_interval(ms=None):
+def set_pr_slow_interval(ms=None, *, wait_ms=1000):
     """Set or query Phaserunner slow polling cycle length (ms)."""
     global _PR_SLOW_MS
     if ms is None:
@@ -554,8 +578,69 @@ def set_pr_slow_interval(ms=None):
         value = 100
     if value < _PR_FAST_MS:
         value = _PR_FAST_MS
-    _PR_SLOW_MS = value
-    return int(_PR_SLOW_MS)
+    resp = pr_bridge.send_command({"cmd": "set_slow", "ms": value}, wait_ms=wait_ms)
+    if not resp or not resp.get("ok"):
+        raise RuntimeError("set_slow failed: {}".format(resp))
+    applied = int(resp.get("slow_ms", value))
+    _PR_SLOW_MS = applied
+    return applied
+
+
+def pr_bridge_status():
+    """Return UART bridge diagnostics (rx counters, last seq/timestamp)."""
+    return pr_bridge.get_bridge_status()
+
+
+def pr_bridge_latest_payload():
+    """Return the most recent raw telemetry frame from the PR-offload MCU."""
+    return pr_bridge.get_latest_payload()
+
+
+def pr_bridge_errors():
+    """Return the last per-register error map reported by the offload MCU."""
+    return pr_bridge.get_last_errors()
+
+
+def pr_ping(wait_ms=1000):
+    """Round-trip ping the PR-offload MCU over the bridge."""
+    return pr_bridge.send_command({"cmd": "ping"}, wait_ms=wait_ms)
+
+
+def pr_status(wait_ms=1000):
+    """Request the PR-offload runtime status (remote cadence, seq, timestamps)."""
+    return pr_bridge.send_command({"cmd": "status"}, wait_ms=wait_ms)
+
+
+def pr_request_snapshot(wait_ms=1000):
+    """Request a synchronous snapshot directly from the PR-offload MCU."""
+    return pr_bridge.send_command({"cmd": "snapshot"}, wait_ms=wait_ms)
+
+
+def pr_version(wait_ms=1000):
+    """Fetch PR-offload firmware/protocol version info."""
+    return pr_bridge.send_command({"cmd": "version"}, wait_ms=wait_ms)
+
+
+def pr_poll_control(action, wait_ms=1000):
+    """Pause/resume the PR-offload poller (action=start|resume|pause|stop)."""
+    action_norm = str(action or "").lower()
+    if action_norm not in ("start", "resume", "pause", "stop"):
+        raise ValueError("action must be start/resume/pause/stop")
+    return pr_bridge.send_command({"cmd": "poll", "action": action_norm}, wait_ms=wait_ms)
+
+
+def pr_offload_reboot(wait_ms=1000):
+    """Command the PR-offload MCU to reboot itself."""
+    return pr_bridge.send_command({"cmd": "reboot"}, wait_ms=wait_ms)
+
+
+def get_pr_snapshot(raw=False):
+    """Return cached Phaserunner telemetry (AppState or raw bridge frame)."""
+    if raw:
+        return pr_bridge_latest_payload()
+    if _state is None:
+        return {}
+    return _state.snapshot_pr()
 
 
 def get_ui_intervals():
@@ -829,6 +914,167 @@ def debug_off():
         print("[t] debug OFF")
 
 
+def _resolve_control_loop_debug_state():
+    motor = _motor
+    if motor is None and _state is not None:
+        motor = getattr(_state, "motor_control", None)
+    cfg = getattr(motor, "cfg", {}) if motor is not None else {}
+    current_enabled = bool(cfg.get("monitor_control_enabled", False))
+    try:
+        current_period = int(cfg.get("monitor_control_period_ms", 1000))
+    except Exception:
+        current_period = 1000
+    desired_enabled = current_enabled if _CONTROL_LOOP_DEBUG_OVERRIDE is None else bool(_CONTROL_LOOP_DEBUG_OVERRIDE)
+    if _CONTROL_LOOP_DEBUG_PERIOD_MS is None:
+        desired_period = current_period
+    else:
+        try:
+            desired_period = int(_CONTROL_LOOP_DEBUG_PERIOD_MS)
+        except Exception:
+            desired_period = current_period
+    if desired_period < 200:
+        desired_period = 200
+    return motor, desired_enabled, desired_period
+
+
+def _apply_control_loop_debug_pref(*, quiet=False):
+    motor, desired_enabled, desired_period = _resolve_control_loop_debug_state()
+    if motor is None:
+        return False
+    setter = getattr(motor, "set_monitor_debug", None)
+    if not callable(setter):
+        if not quiet:
+            print("[t] control loop debug unsupported by motor controller")
+        return False
+    try:
+        setter(desired_enabled, period_ms=desired_period)
+    except Exception as exc:
+        if not quiet:
+            print("[t] control loop debug apply error:", exc)
+        return False
+    if not quiet:
+        state_label = "ON" if desired_enabled else "OFF"
+        if desired_enabled:
+            print("[t] control loop debug {} ({} ms)".format(state_label, desired_period))
+        else:
+            print("[t] control loop debug {}".format(state_label))
+    return True
+
+
+def enable_control_loop_debug(enable=None, period_ms=None):
+    """Enable/disable the MotorControl loop diagnostics (1 Hz printouts)."""
+    global _CONTROL_LOOP_DEBUG_OVERRIDE, _CONTROL_LOOP_DEBUG_PERIOD_MS
+    if enable is not None:
+        _CONTROL_LOOP_DEBUG_OVERRIDE = bool(enable)
+    if period_ms is not None:
+        try:
+            value = int(period_ms)
+        except Exception:
+            raise ValueError("invalid monitor period")
+        if value < 200:
+            value = 200
+        _CONTROL_LOOP_DEBUG_PERIOD_MS = value
+    applied = _apply_control_loop_debug_pref()
+    if not applied and _CONTROL_LOOP_DEBUG_OVERRIDE is not None:
+        print("[t] control loop debug request queued (motor not ready)")
+    if enable is None and period_ms is None:
+        _, desired_enabled, desired_period = _resolve_control_loop_debug_state()
+        return {"enabled": desired_enabled, "period_ms": desired_period}
+    return bool(_CONTROL_LOOP_DEBUG_OVERRIDE if _CONTROL_LOOP_DEBUG_OVERRIDE is not None else False)
+
+
+def _normalize_pid_mode(mode):
+    try:
+        label = str(mode or "").strip().lower()
+    except Exception:
+        label = ""
+    if label in {"spd", "speed_mode"}:
+        return "speed"
+    if label in {"pow", "power_mode"}:
+        return "power"
+    if label in {"tor", "torque_mode", "nm"}:
+        return "torque"
+    normalized = label or "power"
+    if normalized not in {"power", "speed", "torque"}:
+        raise ValueError("mode must be power, speed, or torque for PID tuning")
+    return normalized
+
+
+def _get_motor_controller():
+    motor = _motor
+    if motor is None and _state is not None:
+        motor = getattr(_state, "motor_control", None)
+    return motor
+
+
+def _get_motor_cfg_ref():
+    motor = _get_motor_controller()
+    cfg = getattr(motor, "cfg", None)
+    if isinstance(cfg, dict):
+        return cfg
+    return load_motor_config()
+
+
+def get_pid_params(mode=None, *, include_guidance=True):
+    """Return PID parameters for a given mode (or all modes if None)."""
+    cfg = _get_motor_cfg_ref()
+    if mode is None:
+        modes = ("power", "speed", "torque")
+        return {label: get_pid_params(label, include_guidance=include_guidance) for label in modes}
+    label = _normalize_pid_mode(mode)
+    data = {}
+    for canonical in ("kp", "ki", "kd", "integral_limit", "d_alpha", "output_alpha"):
+        suffix = _PID_PARAM_SUFFIXES.get(canonical, canonical)
+        key = f"{label}_pid_{suffix}"
+        value = cfg.get(key)
+        try:
+            data[canonical] = float(value)
+        except Exception:
+            data[canonical] = value
+    if include_guidance:
+        data["guidance"] = {k: _PID_PARAM_GUIDANCE.get(k, "") for k in _PID_PARAM_GUIDANCE}
+    return data
+
+
+def set_pid_params(mode, persist=True, reset=True, **params):
+    """Update PID gains for the selected mode and optionally persist to disk."""
+    if not params:
+        raise ValueError("no PID parameters provided")
+    label = _normalize_pid_mode(mode)
+    cfg = _get_motor_cfg_ref()
+    changes = {}
+    for key, value in params.items():
+        if key is None:
+            continue
+        canon = str(key).lower().replace(" ", "_")
+        suffix = _PID_PARAM_SUFFIXES.get(canon)
+        if suffix is None:
+            raise ValueError("unsupported PID field: {}".format(key))
+        cfg_key = f"{label}_pid_{suffix}"
+        try:
+            numeric = float(value)
+        except Exception:
+            raise ValueError("invalid value for {}: {}".format(key, value))
+        if suffix in {"d_alpha", "output_alpha"}:
+            if numeric < 0.0:
+                numeric = 0.0
+            if numeric > 1.0:
+                numeric = 1.0
+        changes[cfg_key] = numeric
+    cfg.update(changes)
+    motor = _get_motor_controller()
+    if motor is not None and getattr(motor, "cfg", None) is cfg and reset:
+        reset_fn = getattr(motor, "_reset_pid", None)
+        if callable(reset_fn):
+            try:
+                reset_fn(label if label in {"power", "speed", "torque"} else None)
+            except Exception:
+                pass
+    if persist:
+        _save_motor_config(cfg)
+    return get_pid_params(label)
+
+
 # -------------- Main async --------------
 async def _main_async():
     global _state, _ui, _dashboards, _dashboard_signals, _dashboard_trip, _dashboard_batt_select, _dashboard_batt_status, _page_button
@@ -837,9 +1083,17 @@ async def _main_async():
     _STOP_REQUESTED = False
     _TASKS.clear()
     motor_cfg = _load_motor_config()
+    if _CONTROL_LOOP_DEBUG_OVERRIDE is not None:
+        motor_cfg["monitor_control_enabled"] = bool(_CONTROL_LOOP_DEBUG_OVERRIDE)
+    if _CONTROL_LOOP_DEBUG_PERIOD_MS is not None:
+        try:
+            motor_cfg["monitor_control_period_ms"] = max(200, int(_CONTROL_LOOP_DEBUG_PERIOD_MS))
+        except Exception:
+            motor_cfg["monitor_control_period_ms"] = 1000
     print("[t] _main_async: motor config loaded")
     _motor = _create_motor_control(motor_cfg)
     print("[t] _main_async: motor control ready ->", type(_motor).__name__)
+    _apply_control_loop_debug_pref(quiet=True)
     try:
         trip_scale = float(motor_cfg.get("trip_pulse_to_meter", 0.1))
     except Exception:

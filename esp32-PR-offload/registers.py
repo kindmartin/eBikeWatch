@@ -1,0 +1,33 @@
+# phaserunner_registers.py
+# Definiciones de registros Modbus del Phaserunner
+
+PR_REGISTERS = {
+    "faults":              {"addr": 258, "scale": 1,    "signed": False, "unit": "bitmap"},
+    "controller_temp":     {"addr": 259, "scale": 1,    "signed": True,  "unit": "°C"},
+    "vehicle_speed":       {"addr": 260, "scale": 256,  "signed": False, "unit": "km/h"},
+    "motor_temp":          {"addr": 261, "scale": 1,    "signed": True,  "unit": "°C"},
+    "motor_current":       {"addr": 262, "scale": 32,   "signed": True,  "unit": "A"},
+    "motor_rpm":           {"addr": 263, "scale": 1,    "signed": False, "unit": "RPM"},
+    "motor_speed_pct":     {"addr": 264, "scale": 40.96,"signed": False, "unit": "% rated rpm"},
+    "battery_voltage":     {"addr": 265, "scale": 32,   "signed": False, "unit": "V"},
+    "battery_current":     {"addr": 266, "scale": 32,   "signed": True,  "unit": "A"},
+    "soc":                 {"addr": 267, "scale": 32,   "signed": False, "unit": "%"},
+    "battery_power":       {"addr": 268, "scale": 1,    "signed": True,  "unit": "W"},
+    "last_fault":          {"addr": 269, "scale": 1,    "signed": False, "unit": "bitmap"},
+    "throttle_voltage":    {"addr": 270, "scale": 4096, "signed": True,  "unit": "V"},
+    "brake_voltage_1":     {"addr": 271, "scale": 4096, "signed": True,  "unit": "V"},
+    "brake_voltage_2":     {"addr": 272, "scale": 4096, "signed": True,  "unit": "V"},
+    "raw_temp_sensor_v":   {"addr": 273, "scale": 4096, "signed": True,  "unit": "V"},
+    "digital_inputs":      {"addr": 276, "scale": 1,    "signed": False, "unit": "bitmap"},
+    "warnings":            {"addr": 277, "scale": 1,    "signed": False, "unit": "bitmap"},
+    "phase_a_current":     {"addr": 282, "scale": 32,   "signed": True,  "unit": "A"},
+    "phase_b_current":     {"addr": 283, "scale": 32,   "signed": True,  "unit": "A"},
+    "phase_c_current":     {"addr": 284, "scale": 32,   "signed": True,  "unit": "A"},
+    "phase_a_voltage":     {"addr": 285, "scale": 32,   "signed": True,  "unit": "V"},
+    "phase_b_voltage":     {"addr": 286, "scale": 32,   "signed": True,  "unit": "V"},
+    "phase_c_voltage":     {"addr": 287, "scale": 32,   "signed": True,  "unit": "V"},
+    "motor_input_power":   {"addr": 334, "scale": 1,    "signed": True,  "unit": "W"},
+    "torque_command":      {"addr": 335, "scale": 4096, "signed": True,  "unit": "pu"},
+    "torque_reference":    {"addr": 336, "scale": 4096, "signed": True,  "unit": "pu"},
+    "speed_command":       {"addr": 337, "scale": 4096, "signed": False, "unit": "pu"},
+}

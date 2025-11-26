@@ -3,9 +3,11 @@
 
 import machine
 
-# ── UART para Phaserunner (Modbus)
+# ── UART para Phaserunner (Modbus) y puente PR-offload
+PR_UART_ID = 1
 PR_UART_RX = 15
 PR_UART_TX = 13
+PR_UART_BAUD = 115200
 
 
 # ── SIM7600 (reservados, no usar)

@@ -13,6 +13,12 @@ Use these helpers from the MicroPython REPL after `import t` to inspect or tweak
 - `t.stop_pr_thread(wait_ms=500, disable=True)` &rarr; stop the thread (optionally disable future auto-starts).
 - `t.set_pr_thread(False)` / `t.set_pr_thread(True)` &rarr; disable/enable automatic PR worker management.
 - `t.set_pr_thread_stack()` &rarr; view or update the PR worker stack size (bytes).
+- `t.pr_bridge_status()` &rarr; UART bridge diagnostics (RX counters, last `seq`, last arrival timestamp).
+- `t.pr_bridge_latest_payload()` / `t.get_pr_snapshot(raw=True)` &rarr; inspect the most recent raw telemetry frame received from the PR-offload MCU.
+- `t.pr_ping()` / `t.pr_status()` / `t.pr_request_snapshot()` &rarr; command/response helpers for latency checks, remote cadence info, or an immediate snapshot straight from the offload MCU.
+- `t.pr_version()` &rarr; verify PR-offload firmware/protocol versions (remember to bump `FW_VERSION` in `pr_offload_esp32.py` whenever you flash a new build).
+- `t.pr_poll_control("pause")` / `t.pr_poll_control("resume")` &rarr; pause/resume the offload poller without rebooting it.
+- `t.pr_offload_reboot()` &rarr; remote-reset the PR-offload ESP32 (the bridge thread will reconnect automatically).
 
 ## UI & Integrator Cadences
 - `t.set_ui_frame_interval()` &rarr; current dashboard redraw period.
@@ -70,5 +76,15 @@ Use these helpers from the MicroPython REPL after `import t` to inspect or tweak
 - `snapshot = t._state.snapshot_pr()` &rarr; grab all PR registers at once (dict of `(value, unit)`).
 - `t.get_pr_intervals()` &rarr; confirm current fast/slow periods (`_PR_FAST_MS`, `_PR_SLOW_MS`).
 - `t.print_status()` &rarr; formatted mix of fast + slow data for quick console checks.
+- `t.get_pr_snapshot(raw=True)` &rarr; fetch the last raw JSON frame (`fast`, `slow`, `errors`) buffered by the UART bridge.
+
+### PR-Offload ESP32 Helpers
+- `import pr_offload_esp32 as off` &rarr; get REPL access to the secondary MCU.
+- `off.get_fast_interval()` / `off.set_fast_interval(40)` &rarr; query/update 20&nbsp;Hz loop period (ms).
+- `off.get_slow_interval()` / `off.set_slow_interval(1000)` &rarr; query/update 1&nbsp;Hz snapshot cadence.
+- `off.get_latest("battery_current")` &rarr; last value cached on the offload MCU (fast fields update every loop, slow fields once per snapshot).
+- `off.get_snapshot()` &rarr; dict containing `ts`, `seq`, `fast`, `slow`, and `errors` exactly as streamed over the bridge.
+- `off.get_errors()` &rarr; current per-register error strings (e.g., repeated Modbus timeouts) for quick diagnostics without parsing JSON on the main ESP32.
+- `t.set_pr_fast_interval(ms)`, `t.set_pr_slow_interval(ms)`, `t.pr_poll_control(...)`, `t.pr_offload_reboot()` &rarr; mirrored helpers that talk to the PR-offload MCU from the main ESP32, so field techs can manage the bridge without physically accessing the secondary board.
 
 Keep this file in sync when adding new runtime knobs so quick tuning stays easy during field tests.
