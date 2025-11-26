@@ -7,6 +7,14 @@ import uasyncio as asyncio
 import time
 
 try:
+    from version import module_version
+except ImportError:  # pragma: no cover
+    def module_version(name, default=None):
+        return default if default is not None else "0.0.0"
+
+__version__ = module_version("motor_control")
+
+try:
     from drivers.mcp4725 import MCP4725
 except ImportError:
     from mcp4725 import MCP4725

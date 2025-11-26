@@ -56,6 +56,16 @@ import runtime.phaserunner_worker as pr_bridge
 from runtime.hardware import init_dacs_zero
 from UI_helpers.writer import Writer
 
+try:
+    from version import APP_VERSION, module_version
+except ImportError:  # pragma: no cover
+    APP_VERSION = "0.0.0"
+
+    def module_version(name, default=None):
+        return default if default is not None else APP_VERSION
+
+__version__ = module_version("t")
+
 
 AUTO_START = True
 DEBUG = False   # <-- por defecto NO imprime nada
@@ -483,6 +493,11 @@ def _show_boot_message(ui_display, lines=None):
 # -------------- API pública on-demand --------------
 _state = None
 _ui = None
+
+
+def get_version():
+    """Return the runtime module version string."""
+    return __version__
 
 
 def print_status():

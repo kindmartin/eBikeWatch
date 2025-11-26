@@ -9,6 +9,13 @@ except ImportError:  # pragma: no cover - CPython fallback
 
 from HW import ADC_THROTTLE_PIN, ADC_BRAKE_PIN, make_adc
 from motor_control import MotorControl, DEFAULTS as MOTOR_DEFAULTS, compute_output_voltages
+try:
+    from version import module_version
+except ImportError:  # pragma: no cover
+    def module_version(name, default=None):
+        return default if default is not None else "0.0.0"
+
+__version__ = module_version("runtime.motor")
 
 MOTOR_CONFIG_FILE = "motor_config.json"
 
