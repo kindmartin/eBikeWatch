@@ -1,0 +1,6 @@
+{
+    "chat.agent.maxRequests": 50,
+    "editor.fontSize": 16,
+    "files.autoSave": "afterDelay",
+    "editor.mouseWheelZoom": true
+}
